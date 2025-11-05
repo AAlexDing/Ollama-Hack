@@ -88,16 +88,68 @@ class OllamaClient:
                     status=response.status,
                     message=f"Error fetching {path}: {response.reason}",
                 )
-            async for item in response.content:
-                if response_model:
-                    try:
-                        yield response_model(**json_lib.loads(item))
-                    except Exception as e:
-                        logger.debug(f"Error parsing response: {e}")
-                        logger.debug(f"Response content: {item}")
-                        continue
-                else:
-                    yield item
+            
+            # 流式处理（SSE 格式或逐行 JSON）
+            if response_model:
+                # 对于有 response_model 的情况，收集所有内容组合成完整的 JSON
+                full_content = b""
+                async for chunk in response.content:
+                    full_content += chunk
+                
+                # 尝试解析完整的 JSON
+                try:
+                    parsed_data = json_lib.loads(full_content)
+                    
+                    # 检查是否包含错误字段
+                    if isinstance(parsed_data, dict) and "error" in parsed_data:
+                        error_msg = parsed_data.get("error", "Unknown error")
+                        logger.warning(f"Ollama server returned error: {error_msg}")
+                        raise aiohttp.ClientResponseError(
+                            request_info=response.request_info,
+                            history=response.history,
+                            status=response.status,
+                            message=f"Ollama error: {error_msg}",
+                        )
+                    
+                    # 尝试解析为响应模型
+                    yield response_model(**parsed_data)
+                    return
+                except json_lib.JSONDecodeError:
+                    # 如果不是完整的 JSON，尝试按行处理（SSE 格式）
+                    # 按行分割并处理
+                    lines = full_content.split(b"\n")
+                    for line in lines:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # 处理 SSE 格式：移除 "data: " 前缀
+                        if line.startswith(b"data: "):
+                            line = line[6:]  # 移除 "data: " 前缀
+                        
+                        if not line:
+                            continue
+                        
+                        try:
+                            parsed_data = json_lib.loads(line)
+                            if isinstance(parsed_data, dict) and "error" in parsed_data:
+                                error_msg = parsed_data.get("error", "Unknown error")
+                                logger.warning(f"Ollama server returned error: {error_msg}")
+                                raise aiohttp.ClientResponseError(
+                                    request_info=response.request_info,
+                                    history=response.history,
+                                    status=response.status,
+                                    message=f"Ollama error: {error_msg}",
+                                )
+                            yield response_model(**parsed_data)
+                        except Exception as e:
+                            logger.debug(f"Error parsing line: {e}")
+                            continue
+                    return
+            else:
+                # 对于没有 response_model 的情况，直接返回原始内容
+                async for chunk in response.content:
+                    yield chunk
         return
 
     @overload

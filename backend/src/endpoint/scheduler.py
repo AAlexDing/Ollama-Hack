@@ -237,7 +237,7 @@ class SchedulerService:
     async def schedule_endpoint_test(
         self, endpoint_id: int, run_date: Optional[datetime.datetime] = None
     ) -> Optional[EndpointTestTask]:
-        logger.info(f"Scheduling single test for {endpoint_id}")
+        logger.debug(f"Scheduling single test for {endpoint_id}")
         if run_date is None:
             run_date = now() + datetime.timedelta(seconds=5)
 
@@ -260,7 +260,7 @@ class SchedulerService:
                 )
             )
             if res.scalars().first() is not None:
-                logger.info("Existing running task, skip")
+                logger.debug("Existing running task, skip")
                 return None
 
             # check if task exists and pending in future
@@ -273,7 +273,7 @@ class SchedulerService:
             )
             task = res.scalars().first()
             if task is not None:
-                logger.info("Existing later task, update it")
+                logger.debug("Existing later task, update it")
                 task.scheduled_at = run_date
             else:
                 task = EndpointTestTask(endpoint_id=endpoint_id, scheduled_at=run_date)
@@ -296,7 +296,7 @@ class SchedulerService:
         Run a single endpoint test task with concurrency control and safe session handling.
         """
         async with semaphore:
-            logger.info(f"Running task {task_id} for endpoint {endpoint_id}")
+            logger.debug(f"Running task {task_id} for endpoint {endpoint_id}")
             async with sessionmanager.session() as session:
                 task = await session.get(EndpointTestTask, task_id)
                 if not task or task.status == TaskStatus.DONE:
@@ -312,7 +312,7 @@ class SchedulerService:
                         task = await session.get(EndpointTestTask, task_id)
                         if task:
                             task.status = TaskStatus.DONE
-                logger.info(f"Task {task_id} completed successfully")
+                logger.debug(f"Task {task_id} completed successfully")
             except Exception as e:
                 logger.error(f"Error running task {task_id}: {e}")
                 async with sessionmanager.session() as session:

@@ -15,3 +15,5 @@ export * from "./model";
 export * from "./apikey";
 export * from "./plan";
 export * from "./setting";
+export * from "./fofa";
+export * from "./subscription";

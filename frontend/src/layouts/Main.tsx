@@ -66,6 +66,11 @@ const DashboardLayout = ({
       href: "/apikeys",
     },
     {
+      label: "主动扫描",
+      href: "/fofa",
+      adminOnly: true,
+    },
+    {
       label: "用户管理",
       href: "/users",
       adminOnly: true,
@@ -125,7 +130,7 @@ const DashboardLayout = ({
                       <span>{item.label}</span>
                     </Link>
                   </NavbarItem>
-                ),
+                )
               )}
             </NavbarContent>
           )}
@@ -183,7 +188,7 @@ const DashboardLayout = ({
                         <span>{item.label}</span>
                       </Link>
                     </NavbarMenuItem>
-                  ),
+                  )
                 )
               : null}
             {/* 小屏幕下显示的主题切换选项 */}

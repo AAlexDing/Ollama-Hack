@@ -1,17 +1,14 @@
 from contextlib import asynccontextmanager
 
-import bcrypt
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import Env, get_config
-from .database import create_db_and_tables, sessionmanager
+from .database import create_db_and_tables, ensure_database_exists, sessionmanager
 from .endpoint.scheduler import get_scheduler
 from .logging import get_logger
 from .routes import router
 from .setting.service import init_settings
-
-bcrypt.__about__ = bcrypt  # type: ignore
 
 
 config = get_config()
@@ -26,6 +23,9 @@ docs_url = "/docs" if config.app.env == Env.DEV else None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting application...")
+
+    # Ensure database exists
+    await ensure_database_exists()
 
     # Initialize database
     await create_db_and_tables()

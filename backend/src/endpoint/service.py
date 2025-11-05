@@ -291,7 +291,7 @@ async def process_models_test_results(
     Test all models of an endpoint and update their performance metrics.
     """
     performances = []
-    links = []
+    new_links = []  # 只存储新创建的链接
 
     existing_associations = (
         select(EndpointAIModelDB)
@@ -319,10 +319,29 @@ async def process_models_test_results(
                 performance.endpoint_id = endpoint_id
                 performances.append(performance)
 
-            # 如果关系不存在且ID有效，则创建关联表条目
+            # 如果关系不存在且ID有效，则创建或获取关联表条目
             if model.id not in existing_link_map:
-                link = EndpointAIModelDB(endpoint_id=endpoint_id, ai_model_id=model.id)
-                existing_link_map[model.id] = link
+                # 再次查询数据库，确保记录不存在（处理并发情况）
+                try:
+                    link = await session.get(
+                        EndpointAIModelDB,
+                        (endpoint_id, model.id),
+                    )
+                    if link is None:
+                        # 记录确实不存在，创建新链接
+                        link = EndpointAIModelDB(endpoint_id=endpoint_id, ai_model_id=model.id)
+                        existing_link_map[model.id] = link
+                        new_links.append(link)  # 只将新链接添加到 new_links
+                    else:
+                        # 记录已存在（可能由并发任务创建），使用现有记录
+                        await session.refresh(link)
+                        existing_link_map[model.id] = link
+                except Exception as e:
+                    logger.debug(f"Error checking existing link: {e}")
+                    # 如果查询失败，创建新链接（让数据库处理冲突）
+                    link = EndpointAIModelDB(endpoint_id=endpoint_id, ai_model_id=model.id)
+                    existing_link_map[model.id] = link
+                    new_links.append(link)
             # 如果关系存在，则更新关联表条目
             else:
                 link = existing_link_map[model.id]
@@ -341,8 +360,6 @@ async def process_models_test_results(
                 else:
                     link.max_connection_time = performance.connection_time
 
-            # 添加关联表条目
-            links.append(link)
             if model.id in mission_model_ids:
                 mission_model_ids.remove(model.id)
         except Exception as e:
@@ -354,7 +371,7 @@ async def process_models_test_results(
     for model_id in mission_model_ids:
         link = existing_link_map[model_id]
         link.status = AIModelStatusEnum.MISSING
-        links.append(link)
+        # 注意：这些链接是已存在的，不需要添加到 session，只需要更新属性
         performance = AIModelPerformanceDB(
             endpoint_id=endpoint_id,
             ai_model_id=model_id,
@@ -362,9 +379,44 @@ async def process_models_test_results(
         )
         performances.append(performance)
 
-    # 批量添加所有关联和性能数据
-    if links:
-        session.add_all(links)
+    # 批量添加新创建的链接和性能数据
+    if new_links:
+        # 处理可能的并发冲突
+        links_to_add = []
+        for link in new_links:
+            try:
+                # 再次检查是否已存在（处理并发情况）
+                existing_link = await session.get(
+                    EndpointAIModelDB,
+                    (link.endpoint_id, link.ai_model_id),
+                )
+                if existing_link is None:
+                    # 记录不存在，添加到待插入列表
+                    links_to_add.append(link)
+                else:
+                    # 记录已存在（可能由并发任务创建），使用现有记录
+                    await session.refresh(existing_link)
+                    # 更新 existing_link_map，使用现有记录
+                    existing_link_map[link.ai_model_id] = existing_link
+            except Exception as e:
+                logger.debug(f"Error checking link: {e}")
+                # 如果检查失败，添加到待插入列表（让数据库处理冲突）
+                links_to_add.append(link)
+        
+        # 批量添加剩余的新链接
+        if links_to_add:
+            try:
+                session.add_all(links_to_add)
+            except Exception as e:
+                # 如果批量添加失败（可能是并发冲突），逐个添加
+                logger.debug(f"Batch add failed, trying individual adds: {e}")
+                for link in links_to_add:
+                    try:
+                        session.add(link)
+                    except Exception:
+                        # 如果添加失败（可能是并发冲突），忽略
+                        logger.debug(f"Link already exists, skipping: {link.endpoint_id}-{link.ai_model_id}")
+                        pass
     if performances:
         session.add_all(performances)
 

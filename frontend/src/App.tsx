@@ -13,6 +13,7 @@ const SettingsPage = lazy(() => import("@/pages/settings"));
 const EndpointsPage = lazy(() => import("@/pages/endpoints"));
 const ModelsPage = lazy(() => import("@/pages/models"));
 const ApiKeysPage = lazy(() => import("@/pages/apikeys"));
+const FofaPage = lazy(() => import("@/pages/fofa"));
 const UsersPage = lazy(() => import("@/pages/users"));
 const PlansPage = lazy(() => import("@/pages/plans"));
 const UnauthorizedPage = lazy(() => import("@/pages/unauthorized"));
@@ -45,6 +46,7 @@ function App() {
         <Route element={<ProtectedRoute requireAdmin={true} />}>
           <Route element={<UsersPage />} path="/users/*" />
           <Route element={<PlansPage />} path="/plans/*" />
+          <Route element={<FofaPage />} path="/fofa/*" />
         </Route>
 
         {/* 404 页面 */}

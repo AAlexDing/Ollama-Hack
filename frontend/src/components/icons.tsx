@@ -10,6 +10,7 @@ import {
   faQuestionCircle,
   faSearch,
   faSun,
+  faSync,
 } from "@fortawesome/free-solid-svg-icons";
 
 import { IconSvgProps, FontAwesomeIconProps } from "@/types";
@@ -46,6 +47,10 @@ export const SunIcon = (props: FontAwesomeIconProps) => {
 
 export const SearchIcon = (props: FontAwesomeIconProps) => {
   return <FontAwesomeIcon icon={faSearch} {...props} />;
+};
+
+export const RefreshIcon = (props: FontAwesomeIconProps) => {
+  return <FontAwesomeIcon icon={faSync} {...props} />;
 };
 
 // export const EyeIcon = (props: FontAwesomeIconProps) => {

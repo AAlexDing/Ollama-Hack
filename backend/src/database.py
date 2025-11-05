@@ -1,6 +1,7 @@
 import contextlib
 from typing import Annotated, Any, AsyncIterator
 
+import aiomysql
 from fastapi import Depends
 from sqlalchemy import TEXT
 from sqlalchemy.ext.asyncio import (
@@ -88,13 +89,58 @@ def get_engine_schema():
 sessionmanager = DatabaseSessionManager(
     get_engine_schema(),
     {
-        "echo": (config.app.log_level == LogLevels.DEBUG),
+        "echo": False,  # 关闭SQL语句日志输出
         "pool_size": 50,
         "max_overflow": 100,
         "pool_timeout": 60,
         "pool_recycle": 1800,
     },
 )
+
+
+async def ensure_database_exists():
+    """确保数据库存在,如果不存在则创建"""
+    match config.database.engine:
+        case DatabaseEngine.MYSQL:
+            try:
+                # 连接到 MySQL 服务器（不指定数据库）
+                conn = await aiomysql.connect(
+                    host=config.database.host,
+                    port=config.database.port,
+                    user=config.database.username,
+                    password=config.database.password,
+                    charset="utf8mb4",
+                )
+                
+                cur = await conn.cursor()
+                
+                # 检查数据库是否存在
+                await cur.execute("SHOW DATABASES LIKE %s", (config.database.db,))
+                result = await cur.fetchone()
+                
+                if result:
+                    logger.info(f"数据库 '{config.database.db}' 已存在")
+                else:
+                    # 创建数据库
+                    logger.info(f"正在创建数据库 '{config.database.db}'...")
+                    await cur.execute(
+                        f"CREATE DATABASE IF NOT EXISTS `{config.database.db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    )
+                    await conn.commit()
+                    logger.info(f"数据库 '{config.database.db}' 创建成功！")
+                
+                await cur.close()
+                conn.close()
+                
+            except Exception as e:
+                logger.error(f"创建数据库失败: {e}")
+                logger.error("请检查：")
+                logger.error(f"1. MySQL 服务器是否运行在 {config.database.host}:{config.database.port}")
+                logger.error(f"2. 用户名 '{config.database.username}' 和密码是否正确")
+                logger.error(f"3. 用户是否有创建数据库的权限")
+                raise
+        case _:
+            raise ValueError(f"不支持的数据库引擎: {config.database.engine}")
 
 
 async def create_db_and_tables():
