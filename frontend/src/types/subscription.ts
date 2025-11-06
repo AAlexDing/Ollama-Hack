@@ -23,6 +23,10 @@ export interface SubscriptionInfo {
   total_created: number;
   is_enabled: boolean;
   error_message: string | null;
+  status: string;
+  progress_current: number;
+  progress_total: number;
+  progress_message: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -39,3 +43,11 @@ export interface UpdateSubscriptionRequest {
   is_enabled?: boolean;
 }
 
+export interface SubscriptionProgressResponse {
+  subscription_id: number;
+  status: string;
+  progress_current: number;
+  progress_total: number;
+  progress_message: string | null;
+  error_message: string | null;
+}

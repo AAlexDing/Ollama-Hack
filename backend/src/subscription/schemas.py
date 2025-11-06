@@ -43,6 +43,10 @@ class SubscriptionInfo(BaseModel):
     total_created: int
     is_enabled: bool
     error_message: Optional[str]
+    status: str
+    progress_current: int
+    progress_total: int
+    progress_message: Optional[str]
     created_at: datetime
     updated_at: datetime
 
@@ -54,4 +58,15 @@ class PullSubscriptionResponse(BaseModel):
     pull_count: int
     created_count: int
     message: str
+
+
+class SubscriptionProgressResponse(BaseModel):
+    """订阅进度响应"""
+
+    subscription_id: int
+    status: str
+    progress_current: int
+    progress_total: int
+    progress_message: Optional[str]
+    error_message: Optional[str] = None
 

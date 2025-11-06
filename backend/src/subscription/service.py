@@ -15,13 +15,14 @@ from src.endpoint.service import create_test_task
 from src.logging import get_logger
 from src.utils import now
 
-from .models import SubscriptionDB, SubscriptionPullHistoryDB
+from .models import SubscriptionDB, SubscriptionPullHistoryDB, SubscriptionStatusEnum
 from .schemas import (
     PullSubscriptionResponse,
     SubscriptionInfo,
     SubscriptionItem,
     SubscriptionRequest,
     SubscriptionResponse,
+    SubscriptionProgressResponse,
 )
 
 logger = get_logger(__name__)
@@ -101,17 +102,36 @@ async def pull_subscription(
             detail=f"Subscription {subscription_id} is disabled",
         )
 
+    # 保存订阅 URL，避免后续访问时对象过期
+    subscription_url = subscription.url
+
+    # 设置状态为拉取中
+    subscription.status = SubscriptionStatusEnum.PULLING
+    subscription.progress_current = 0
+    subscription.progress_total = 0
+    subscription.progress_message = "正在拉取订阅数据..."
+    await session.commit()
+    await session.refresh(subscription)
+
     try:
         # 拉取JSON数据
         # 先尝试正常SSL连接，失败时降级到不验证SSL（用于处理自签名证书等情况）
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
         data = None
         last_error = None
+        
+        # 设置请求头（模拟浏览器请求，避免被服务器拒绝）
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        }
 
         # 第一次尝试：正常SSL验证
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as http_session:
-                async with http_session.get(subscription.url, allow_redirects=True) as response:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as http_session:
+                async with http_session.get(subscription_url, allow_redirects=True) as response:
                     if response.status != 200:
                         error_detail = f"HTTP {response.status}: {response.reason}"
                         try:
@@ -124,15 +144,22 @@ async def pull_subscription(
                             status_code=status.HTTP_502_BAD_GATEWAY,
                             detail=f"Failed to fetch subscription: {error_detail}",
                         )
-                    data = await response.json()
-                    logger.debug(f"订阅拉取成功（正常SSL）: {subscription.url}")
+                    try:
+                        data = await response.json()
+                        logger.debug(f"订阅拉取成功（正常SSL）: {subscription_url}")
+                    except Exception as json_err:
+                        logger.error(f"订阅数据JSON解析失败: {subscription_url}, 错误: {str(json_err)}")
+                        raise HTTPException(
+                            status_code=status.HTTP_502_BAD_GATEWAY,
+                            detail=f"Failed to parse JSON response: {str(json_err)}",
+                        )
         except (aiohttp.ClientError, asyncio.TimeoutError, HTTPException) as e:
             # 如果是HTTPException（非200状态码），直接抛出
             if isinstance(e, HTTPException):
                 raise
             last_error = e
             logger.warning(
-                f"订阅拉取正常SSL连接失败: {subscription.url}, "
+                f"订阅拉取正常SSL连接失败: {subscription_url}, "
                 f"错误: {str(e)}, 尝试不验证SSL..."
             )
 
@@ -143,8 +170,8 @@ async def pull_subscription(
                 ssl_context.verify_mode = ssl.CERT_NONE
                 connector = aiohttp.TCPConnector(ssl=ssl_context, limit=10)
 
-                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as http_session:
-                    async with http_session.get(subscription.url, allow_redirects=True) as response:
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as http_session:
+                    async with http_session.get(subscription_url, allow_redirects=True) as response:
                         if response.status != 200:
                             error_detail = f"HTTP {response.status}: {response.reason}"
                             try:
@@ -157,18 +184,22 @@ async def pull_subscription(
                                 status_code=status.HTTP_502_BAD_GATEWAY,
                                 detail=f"Failed to fetch subscription: {error_detail}",
                             )
-                        data = await response.json()
-                        logger.debug(f"订阅拉取成功（不验证SSL）: {subscription.url}")
+                        try:
+                            data = await response.json()
+                            logger.debug(f"订阅拉取成功（不验证SSL）: {subscription_url}")
+                        except Exception as json_err:
+                            logger.error(f"订阅数据JSON解析失败（不验证SSL）: {subscription_url}, 错误: {str(json_err)}")
+                            raise aiohttp.ClientError(f"Failed to parse JSON: {str(json_err)}")
             except aiohttp.ClientError as e2:
                 error_msg = f"Connection error: {str(e2)} (tried both SSL verified and unverified)"
-                logger.error(f"订阅拉取连接错误: {subscription.url}, {error_msg}")
+                logger.error(f"订阅拉取连接错误: {subscription_url}, {error_msg}")
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
                     detail=error_msg,
                 )
             except asyncio.TimeoutError:
                 error_msg = "Connection timeout (30s)"
-                logger.error(f"订阅拉取超时: {subscription.url}")
+                logger.error(f"订阅拉取超时: {subscription_url}")
                 raise HTTPException(
                     status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                     detail=error_msg,
@@ -183,6 +214,12 @@ async def pull_subscription(
         # 解析JSON数据
         items: List[SubscriptionItem] = [SubscriptionItem(**item) for item in data]
 
+        # 设置状态为处理中
+        subscription.status = SubscriptionStatusEnum.PROCESSING
+        subscription.progress_message = f"正在解析 {len(items)} 个订阅项..."
+        await session.commit()
+        await session.refresh(subscription)
+
         # 1. 提取并验证所有服务器URL，去重
         valid_urls = []
         for item in items:
@@ -194,6 +231,12 @@ async def pull_subscription(
         
         # 去重（在订阅数据中可能有重复的URL）
         valid_urls = list(set(valid_urls))
+        
+        # 更新进度总数
+        subscription.progress_total = len(valid_urls)
+        subscription.progress_message = f"正在处理 {len(valid_urls)} 个端点..."
+        await session.commit()
+        await session.refresh(subscription)
         
         if not valid_urls:
             logger.warning("订阅拉取的数据中没有有效的服务器URL")
@@ -231,33 +274,59 @@ async def pull_subscription(
             new_endpoint_ids = [row[1] for row in result.all() if row[1] is not None]
             created_count = len(new_endpoint_ids)
         
-        # 5. 合并所有端点ID（已存在的 + 新创建的）
-        all_endpoint_ids = list(existing_urls_map.values()) + new_endpoint_ids
+        # 更新进度
+        subscription.progress_current = len(valid_urls)
+        subscription.progress_message = f"端点处理完成，共创建 {created_count} 个新端点"
+        await session.commit()
+        await session.refresh(subscription)
         
-        # 6. 为所有端点创建测试任务（延迟或立即）
-        if all_endpoint_ids:
-            if test_delay_seconds > 0:
-                from src.endpoint.scheduler import get_scheduler
-                
-                scheduler = get_scheduler()
-                for endpoint_id in all_endpoint_ids:
-                    if endpoint_id:
-                        await scheduler.schedule_endpoint_test(
-                            endpoint_id, now() + timedelta(seconds=test_delay_seconds)
-                        )
-            else:
-                for endpoint_id in all_endpoint_ids:
-                    if endpoint_id:
-                        await create_test_task(session, endpoint_id)
-
-        # 更新订阅记录
+        # 先设置 COMPLETED 状态，不要等待测试任务创建
         subscription.last_pull_at = now()
         subscription.last_pull_count = len(items)
         subscription.total_pulls += 1
         subscription.total_created += created_count
         subscription.error_message = None
+        subscription.status = SubscriptionStatusEnum.COMPLETED
+        
+        # 根据是否有新端点来设置不同的消息
+        if created_count > 0:
+            subscription.progress_message = f"成功拉取 {len(items)} 个服务器，创建 {created_count} 个新端点，正在为新端点创建测试任务..."
+        else:
+            subscription.progress_message = f"成功拉取 {len(items)} 个服务器，创建 {created_count} 个新端点（所有端点已存在）"
+        
         subscription.updated_at = now()
         await session.commit()
+        await session.refresh(subscription)
+        logger.info(f"订阅 {subscription_id} 状态已设置为 COMPLETED，新创建 {created_count} 个端点")
+        
+        # 5. 仅为新创建的端点创建测试任务（延迟或立即）
+        # 在后台异步创建，不阻塞订阅拉取完成
+        if new_endpoint_ids:
+            try:
+                logger.info(f"开始为 {len(new_endpoint_ids)} 个新端点创建测试任务...")
+                if test_delay_seconds > 0:
+                    from src.endpoint.scheduler import get_scheduler
+                    
+                    scheduler = get_scheduler()
+                    for endpoint_id in new_endpoint_ids:
+                        if endpoint_id:
+                            await scheduler.schedule_endpoint_test(
+                                endpoint_id, now() + timedelta(seconds=test_delay_seconds)
+                            )
+                else:
+                    for endpoint_id in new_endpoint_ids:
+                        if endpoint_id:
+                            await create_test_task(session, endpoint_id)
+                logger.info(f"测试任务创建完成，共 {len(new_endpoint_ids)} 个")
+                
+                # 更新进度消息（任务创建完成）
+                subscription.progress_message = f"成功拉取 {len(items)} 个服务器，创建 {created_count} 个新端点，已为新端点创建 {len(new_endpoint_ids)} 个测试任务"
+                await session.commit()
+            except Exception as task_err:
+                logger.warning(f"创建测试任务时发生错误: {str(task_err)}")
+                # 更新进度消息（任务创建失败）
+                subscription.progress_message = f"成功拉取 {len(items)} 个服务器，创建 {created_count} 个新端点（测试任务创建失败: {str(task_err)[:100]}）"
+                await session.commit()
 
         # 创建拉取历史记录
         history = SubscriptionPullHistoryDB(
@@ -269,7 +338,7 @@ async def pull_subscription(
         await session.commit()
 
         logger.info(
-            f"订阅拉取完成: {subscription.url}, "
+            f"订阅拉取完成: {subscription_url}, "
             f"拉取 {len(items)} 个, 创建 {created_count} 个端点"
         )
 
@@ -284,7 +353,7 @@ async def pull_subscription(
         raise
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"订阅拉取失败: {subscription.url}, 错误: {error_msg}")
+        logger.error(f"订阅拉取失败: {subscription_url}, 错误: {error_msg}")
 
         # 更新错误信息（重新获取 subscription 对象，避免访问过期属性）
         try:
@@ -294,6 +363,8 @@ async def pull_subscription(
             subscription = await session.get(SubscriptionDB, subscription_id)
             if subscription:
                 subscription.error_message = error_msg
+                subscription.status = SubscriptionStatusEnum.FAILED
+                subscription.progress_message = f"拉取失败: {error_msg}"
                 subscription.updated_at = now()
                 await session.commit()
         except Exception as update_error:
@@ -338,6 +409,15 @@ async def create_subscription(
                 logger.info(f"订阅 {subscription_id} 首次拉取完成")
             except Exception as e:
                 logger.error(f"订阅 {subscription_id} 首次拉取失败: {e}", exc_info=True)
+                # 确保失败时更新状态
+                try:
+                    sub = await bg_session.get(SubscriptionDB, subscription_id)
+                    if sub:
+                        sub.status = SubscriptionStatusEnum.FAILED
+                        sub.progress_message = f"首次拉取失败: {str(e)}"
+                        await bg_session.commit()
+                except Exception as update_error:
+                    logger.error(f"更新订阅状态失败: {update_error}")
 
     # 在后台执行首次拉取，不阻塞响应
     if subscription.id:
@@ -385,6 +465,10 @@ async def get_subscription_info(session: DBSessionDep, subscription_id: int) -> 
         total_created=subscription.total_created,
         is_enabled=subscription.is_enabled,
         error_message=subscription.error_message,
+        status=subscription.status.value,
+        progress_current=subscription.progress_current,
+        progress_total=subscription.progress_total,
+        progress_message=subscription.progress_message,
         created_at=subscription.created_at,
         updated_at=subscription.updated_at,
     )
@@ -417,6 +501,10 @@ async def list_subscriptions(session: DBSessionDep, limit: int = 20, offset: int
             total_created=sub.total_created,
             is_enabled=sub.is_enabled,
             error_message=sub.error_message,
+            status=sub.status.value,
+            progress_current=sub.progress_current,
+            progress_total=sub.progress_total,
+            progress_message=sub.progress_message,
             created_at=sub.created_at,
             updated_at=sub.updated_at,
         )
@@ -471,7 +559,44 @@ async def update_subscription(
         total_created=subscription.total_created,
         is_enabled=subscription.is_enabled,
         error_message=subscription.error_message,
+        status=subscription.status.value,
+        progress_current=subscription.progress_current,
+        progress_total=subscription.progress_total,
+        progress_message=subscription.progress_message,
         created_at=subscription.created_at,
         updated_at=subscription.updated_at,
+    )
+
+
+async def get_subscription_progress(
+    session: DBSessionDep, subscription_id: int
+) -> SubscriptionProgressResponse:
+    """
+    获取订阅进度
+    
+    Args:
+        session: 数据库会话
+        subscription_id: 订阅ID
+        
+    Returns:
+        订阅进度信息
+    """
+    query = select(SubscriptionDB).where(SubscriptionDB.id == subscription_id)
+    result = await session.execute(query)
+    subscription = result.scalar_one_or_none()
+    
+    if not subscription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Subscription {subscription_id} not found",
+        )
+    
+    return SubscriptionProgressResponse(
+        subscription_id=subscription.id if subscription.id else 0,
+        status=subscription.status.value,
+        progress_current=subscription.progress_current,
+        progress_total=subscription.progress_total,
+        progress_message=subscription.progress_message,
+        error_message=subscription.error_message,
     )
 

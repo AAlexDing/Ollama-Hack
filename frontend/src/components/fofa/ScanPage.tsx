@@ -1,7 +1,14 @@
 /**
  * FOFA扫描页面组件 - 使用HeroUI
  */
-import React, { useState } from "react";
+import type {
+  FofaScanRequest,
+  FofaScanInfo,
+  SubscriptionRequest,
+  SubscriptionInfo,
+} from "@/types";
+
+import React, { useState, useRef } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@heroui/button";
 import { Card, CardBody, CardHeader } from "@heroui/card";
@@ -19,13 +26,8 @@ import {
 import { Chip } from "@heroui/chip";
 import { Progress } from "@heroui/progress";
 import { addToast } from "@heroui/toast";
+
 import { fofaApi, subscriptionApi } from "@/api";
-import type {
-  FofaScanRequest,
-  FofaScanInfo,
-  SubscriptionRequest,
-  SubscriptionInfo,
-} from "@/types";
 import DashboardLayout from "@/layouts/Main";
 import { SearchIcon, RefreshIcon } from "@/components/icons";
 
@@ -73,9 +75,17 @@ const FofaScanPage: React.FC = () => {
 
   // 订阅表单状态
   const [subscriptionUrl, setSubscriptionUrl] = useState(
-    "https://awesome-ollama-server.vercel.app/data.json",
+    "https://awesome-ollama-server.vercel.app/data.json"
   );
   const [pullInterval, setPullInterval] = useState("300");
+
+  // 进度轮询状态
+  const [pullingSubscriptionId, setPullingSubscriptionId] = useState<
+    number | null
+  >(null);
+  
+  // 用于防止重复显示 Toast
+  const lastCompletedSubscriptionRef = useRef<number | null>(null);
 
   // 获取扫描历史
   const {
@@ -95,9 +105,88 @@ const FofaScanPage: React.FC = () => {
     refetch: refetchSubscriptions,
   } = useQuery({
     queryKey: ["subscriptions"],
-    queryFn: () => subscriptionApi.getSubscriptionList({ limit: 10, offset: 0 }),
+    queryFn: () =>
+      subscriptionApi.getSubscriptionList({ limit: 10, offset: 0 }),
     refetchInterval: autoRefresh ? 5000 : false,
   });
+
+  // 监听 pullingSubscriptionId 变化
+  React.useEffect(() => {
+    console.log("[状态监听] pullingSubscriptionId 变化:", pullingSubscriptionId);
+  }, [pullingSubscriptionId]);
+
+  // 订阅进度轮询
+  const { data: subscriptionProgress } = useQuery({
+    queryKey: ["subscription-progress", pullingSubscriptionId],
+    queryFn: () => subscriptionApi.getProgress(pullingSubscriptionId!),
+    refetchInterval: (data) => {
+      // 如果数据还没加载，继续轮询
+      if (!data) {
+        return 2000;
+      }
+
+      // 调试：打印状态
+      console.log("[订阅进度-轮询] 当前状态:", data.status, "进度:", data.progress_current, "/", data.progress_total);
+
+      // 如果状态为 PULLING 或 PROCESSING，继续轮询
+      if (data.status === "pulling" || data.status === "processing" || data.status === "idle") {
+        return 2000; // 2秒轮询
+      }
+
+      // 完成或失败时，停止轮询（状态清除在 useEffect 中处理）
+      if (data.status === "completed" || data.status === "failed") {
+        console.log("[订阅进度-轮询] 检测到完成/失败状态，返回 false 停止轮询");
+        return false; // 停止轮询
+      }
+
+      // 其他状态，继续轮询
+      return 2000;
+    },
+    enabled: pullingSubscriptionId !== null,
+  });
+
+  // 监听进度数据变化，处理完成/失败状态
+  React.useEffect(() => {
+    if (!subscriptionProgress || !pullingSubscriptionId) return;
+
+    console.log("[订阅进度-Effect] 数据变化:", subscriptionProgress.status, "订阅ID:", subscriptionProgress.subscription_id);
+
+    // 防止重复处理同一个订阅的完成状态
+    if (lastCompletedSubscriptionRef.current === subscriptionProgress.subscription_id) {
+      console.log("[订阅进度-Effect] 该订阅已处理过，跳过");
+      return;
+    }
+
+    // 当检测到完成或失败状态时，清除轮询 ID
+    if (subscriptionProgress.status === "completed" || subscriptionProgress.status === "failed") {
+      console.log("[订阅进度-Effect] 检测到完成/失败，准备清除状态");
+      
+      // 标记为已处理
+      lastCompletedSubscriptionRef.current = subscriptionProgress.subscription_id;
+      
+      // 显示完成提示
+      if (subscriptionProgress.status === "completed") {
+        addToast({
+          title: "订阅拉取完成",
+          description: subscriptionProgress.progress_message || "订阅拉取成功",
+          color: "success",
+          duration: 3000,
+        });
+      } else if (subscriptionProgress.status === "failed") {
+        addToast({
+          title: "订阅拉取失败",
+          description: subscriptionProgress.error_message || subscriptionProgress.progress_message || "订阅拉取失败",
+          color: "danger",
+          duration: 5000,
+        });
+      }
+
+      // 立即清除状态
+      console.log("[订阅进度-Effect] 立即清除 pullingSubscriptionId");
+      setPullingSubscriptionId(null);
+      queryClient.invalidateQueries({ queryKey: ["subscriptions"] });
+    }
+  }, [subscriptionProgress, pullingSubscriptionId, addToast, queryClient]);
 
   // 启动扫描
   const startScanMutation = useMutation({
@@ -128,20 +217,29 @@ const FofaScanPage: React.FC = () => {
 
   // 创建订阅
   const createSubscriptionMutation = useMutation({
-    mutationFn: (data: SubscriptionRequest) => subscriptionApi.createSubscription(data),
+    mutationFn: (data: SubscriptionRequest) =>
+      subscriptionApi.createSubscription(data),
     onSuccess: (response) => {
+      // 重置完成标记，允许新的拉取
+      lastCompletedSubscriptionRef.current = null;
+      
       addToast({
         title: "订阅已创建",
         description: response.message,
         color: "success",
         duration: 3000,
       });
-      queryClient.invalidateQueries({ queryKey: ["subscriptions"] });
+      // 确保轮询已启动（如果 onMutate 没触发）
+      if (pullingSubscriptionId !== response.subscription_id) {
+        setPullingSubscriptionId(response.subscription_id);
+      }
       // 重置表单
       setSubscriptionUrl("https://awesome-ollama-server.vercel.app/data.json");
       setPullInterval("300");
     },
     onError: (error: any) => {
+      // 出错时停止轮询
+      setPullingSubscriptionId(null);
       addToast({
         title: "订阅创建失败",
         description: error.response?.data?.detail || error.message,
@@ -154,23 +252,34 @@ const FofaScanPage: React.FC = () => {
   // 手动拉取订阅
   const pullSubscriptionMutation = useMutation({
     mutationFn: (subscriptionId: number) =>
-      subscriptionApi.pullSubscription(subscriptionId, parseInt(testDelay) || 5),
-    onSuccess: (response) => {
-      addToast({
-        title: "订阅拉取成功",
-        description: response.message,
-        color: "success",
-        duration: 3000,
-      });
-      queryClient.invalidateQueries({ queryKey: ["subscriptions"] });
+      subscriptionApi.pullSubscription(
+        subscriptionId,
+        parseInt(testDelay) || 5
+      ),
+    onMutate: (subscriptionId) => {
+      // 重置完成标记，允许新的拉取
+      lastCompletedSubscriptionRef.current = null;
+      // 立即启动进度轮询（在请求发送时）
+      console.log("[手动拉取] onMutate - 设置轮询ID:", subscriptionId);
+      setPullingSubscriptionId(subscriptionId);
     },
-    onError: (error: any) => {
+    onSuccess: (response, subscriptionId) => {
+      // 后台任务已启动，继续轮询
+      console.log("[手动拉取] onSuccess - 后台任务已启动:", response.message, "当前轮询ID:", subscriptionId);
+    },
+    onError: (error: any, subscriptionId) => {
+      // 出错时停止轮询
+      console.log("[手动拉取] onError - 停止轮询");
+      setPullingSubscriptionId(null);
       addToast({
         title: "订阅拉取失败",
         description: error.response?.data?.detail || error.message,
         color: "danger",
         duration: 5000,
       });
+    },
+    onSettled: (data, error, subscriptionId) => {
+      console.log("[手动拉取] onSettled - 请求已完成, 当前pullingSubscriptionId:", pullingSubscriptionId);
     },
   });
 
@@ -183,6 +292,7 @@ const FofaScanPage: React.FC = () => {
       auto_test: autoTest,
       test_delay_seconds: parseInt(testDelay) || 5,
     };
+
     startScanMutation.mutate(requestData);
   };
 
@@ -193,6 +303,7 @@ const FofaScanPage: React.FC = () => {
       url: subscriptionUrl,
       pull_interval: parseInt(pullInterval) || 300,
     };
+
     createSubscriptionMutation.mutate(requestData);
   };
 
@@ -200,6 +311,7 @@ const FofaScanPage: React.FC = () => {
   const renderStatusCell = (scan: FofaScanInfo) => {
     const color = STATUS_COLOR_MAP[scan.status] || "default";
     const text = STATUS_TEXT_MAP[scan.status] || scan.status;
+
     return (
       <Chip color={color} size="sm" variant="flat">
         {text}
@@ -210,12 +322,15 @@ const FofaScanPage: React.FC = () => {
   // 渲染时间
   const renderDate = (dateString: string | null) => {
     if (!dateString) return "-";
+
     return new Date(dateString).toLocaleString("zh-CN");
   };
 
   // 获取当前订阅（最新的一个）
   const currentSubscription: SubscriptionInfo | null =
-    subscriptionList && subscriptionList.length > 0 ? subscriptionList[0] : null;
+    subscriptionList && subscriptionList.length > 0
+      ? subscriptionList[0]
+      : null;
 
   return (
     <DashboardLayout current_root_href="/fofa">
@@ -224,92 +339,92 @@ const FofaScanPage: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {/* FOFA扫描卡片 */}
           <Card>
-          <CardHeader className="flex gap-3 items-center justify-between">
-            <div className="flex flex-col">
-              <p className="text-lg font-semibold">主动扫描</p>
-              <p className="text-sm text-default-500">
-                自动发现全球范围内的 Ollama 服务
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-default-500">自动刷新:</span>
-              <Switch
-                size="sm"
-                isSelected={autoRefresh}
-                onValueChange={setAutoRefresh}
-              />
-              <Button
-                isIconOnly
-                size="sm"
-                variant="light"
-                onPress={() => refetch()}
-              >
-                <RefreshIcon />
-              </Button>
-            </div>
-          </CardHeader>
-          <CardBody>
-            <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-              <Select
-                label="目标国家"
-                placeholder="选择国家"
-                selectedKeys={[country]}
-                onChange={(e) => setCountry(e.target.value)}
-                description="选择要扫描的国家，系统会搜索该国家的Ollama服务"
-                isRequired
-              >
-                {COUNTRY_OPTIONS.map((option) => (
-                  <SelectItem key={option.key} value={option.key}>
-                    {option.label}
-                  </SelectItem>
-                ))}
-              </Select>
-
-              <Textarea
-                label="自定义查询（可选）"
-                placeholder='例如: app="Ollama" && city="Beijing"'
-                value={customQuery}
-                onChange={(e) => setCustomQuery(e.target.value)}
-                description="高级用户可以自定义FOFA查询语句"
-                minRows={2}
-              />
-
-              <div className="flex items-center gap-2">
-                <Switch
-                  size="sm"
-                  isSelected={autoTest}
-                  onValueChange={setAutoTest}
-                >
-                  自动触发检测
-                </Switch>
-                <span className="text-xs text-default-500">
-                  扫描完成后自动对发现的端点进行性能检测
-                </span>
+            <CardHeader className="flex gap-3 items-center justify-between">
+              <div className="flex flex-col">
+                <p className="text-lg font-semibold">主动扫描</p>
+                <p className="text-sm text-default-500">
+                  自动发现全球范围内的 Ollama 服务
+                </p>
               </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm text-default-500">自动刷新:</span>
+                <Switch
+                  isSelected={autoRefresh}
+                  size="sm"
+                  onValueChange={setAutoRefresh}
+                />
+                <Button
+                  isIconOnly
+                  size="sm"
+                  variant="light"
+                  onPress={() => refetch()}
+                >
+                  <RefreshIcon />
+                </Button>
+              </div>
+            </CardHeader>
+            <CardBody>
+              <form className="flex flex-col gap-4" onSubmit={handleSubmit}>
+                <Select
+                  isRequired
+                  description="选择要扫描的国家，系统会搜索该国家的Ollama服务"
+                  label="目标国家"
+                  placeholder="选择国家"
+                  selectedKeys={[country]}
+                  onChange={(e) => setCountry(e.target.value)}
+                >
+                  {COUNTRY_OPTIONS.map((option) => (
+                    <SelectItem key={option.key} value={option.key}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </Select>
 
-              <Input
-                type="number"
-                label="检测延迟（秒）"
-                placeholder="5"
-                value={testDelay}
-                onChange={(e) => setTestDelay(e.target.value)}
-                description="扫描完成后等待多少秒再开始检测"
-                min="0"
-                max="300"
-                isRequired
-              />
+                <Textarea
+                  description="高级用户可以自定义FOFA查询语句"
+                  label="自定义查询（可选）"
+                  minRows={2}
+                  placeholder='例如: app="Ollama" && city="Beijing"'
+                  value={customQuery}
+                  onChange={(e) => setCustomQuery(e.target.value)}
+                />
 
-              <Button
-                type="submit"
-                color="primary"
-                isLoading={startScanMutation.isPending}
-                startContent={!startScanMutation.isPending && <SearchIcon />}
-                fullWidth
-              >
-                启动扫描
-              </Button>
-            </form>
-          </CardBody>
+                <div className="flex items-center gap-2">
+                  <Switch
+                    isSelected={autoTest}
+                    size="sm"
+                    onValueChange={setAutoTest}
+                  >
+                    自动触发检测
+                  </Switch>
+                  <span className="text-xs text-default-500">
+                    扫描完成后自动对发现的端点进行性能检测
+                  </span>
+                </div>
+
+                <Input
+                  isRequired
+                  description="扫描完成后等待多少秒再开始检测"
+                  label="检测延迟（秒）"
+                  max="300"
+                  min="0"
+                  placeholder="5"
+                  type="number"
+                  value={testDelay}
+                  onChange={(e) => setTestDelay(e.target.value)}
+                />
+
+                <Button
+                  fullWidth
+                  color="primary"
+                  isLoading={startScanMutation.isPending}
+                  startContent={!startScanMutation.isPending && <SearchIcon />}
+                  type="submit"
+                >
+                  启动扫描
+                </Button>
+              </form>
+            </CardBody>
           </Card>
 
           {/* 订阅卡片 */}
@@ -331,33 +446,36 @@ const FofaScanPage: React.FC = () => {
               </Button>
             </CardHeader>
             <CardBody>
-              <form onSubmit={handleSubscriptionSubmit} className="flex flex-col gap-4">
+              <form
+                className="flex flex-col gap-4"
+                onSubmit={handleSubscriptionSubmit}
+              >
                 <Input
+                  isRequired
+                  description="订阅JSON数据源的URL地址"
                   label="订阅地址"
                   placeholder="https://awesome-ollama-server.vercel.app/data.json"
                   value={subscriptionUrl}
                   onChange={(e) => setSubscriptionUrl(e.target.value)}
-                  description="订阅JSON数据源的URL地址"
-                  isRequired
                 />
 
                 <Input
-                  type="number"
+                  isRequired
+                  description="自动拉取订阅的时间间隔（60-86400秒）"
                   label="拉取间隔（秒）"
+                  max="86400"
+                  min="60"
                   placeholder="300"
+                  type="number"
                   value={pullInterval}
                   onChange={(e) => setPullInterval(e.target.value)}
-                  description="自动拉取订阅的时间间隔（60-86400秒）"
-                  min="60"
-                  max="86400"
-                  isRequired
                 />
 
                 <Button
-                  type="submit"
+                  fullWidth
                   color="primary"
                   isLoading={createSubscriptionMutation.isPending}
-                  fullWidth
+                  type="submit"
                 >
                   创建/更新订阅
                 </Button>
@@ -371,7 +489,9 @@ const FofaScanPage: React.FC = () => {
                       <span className="text-default-500">上次拉取:</span>
                       <span className="font-medium">
                         {currentSubscription.last_pull_at
-                          ? new Date(currentSubscription.last_pull_at).toLocaleString("zh-CN")
+                          ? new Date(
+                              currentSubscription.last_pull_at
+                            ).toLocaleString("zh-CN")
                           : "从未拉取"}
                       </span>
                     </div>
@@ -393,17 +513,72 @@ const FofaScanPage: React.FC = () => {
                         {currentSubscription.total_created} 个
                       </span>
                     </div>
+
+                    {/* 进度显示 */}
+                    {subscriptionProgress &&
+                      pullingSubscriptionId === currentSubscription.id && (
+                        <div className="mt-3 space-y-2">
+                          <Progress
+                            color={
+                              subscriptionProgress.status === "failed"
+                                ? "danger"
+                                : subscriptionProgress.status === "completed"
+                                  ? "success"
+                                  : "primary"
+                            }
+                            label={
+                              subscriptionProgress.progress_message ||
+                              "处理中..."
+                            }
+                            maxValue={
+                              subscriptionProgress.progress_total || 100
+                            }
+                            showValueLabel={true}
+                            size="sm"
+                            value={subscriptionProgress.progress_current}
+                          />
+                          <div className="space-y-1">
+                            <p className="text-xs text-default-500 text-center">
+                              {subscriptionProgress.status === "pulling" &&
+                                "正在拉取数据..."}
+                              {subscriptionProgress.status === "processing" &&
+                                `处理中: ${subscriptionProgress.progress_current}/${subscriptionProgress.progress_total}`}
+                              {subscriptionProgress.status === "completed" &&
+                                "拉取完成"}
+                              {subscriptionProgress.status === "failed" &&
+                                "拉取失败"}
+                            </p>
+                            {/* 显示错误详情 */}
+                            {subscriptionProgress.status === "failed" &&
+                              subscriptionProgress.error_message && (
+                                <p className="text-xs text-danger text-center px-2">
+                                  错误原因: {subscriptionProgress.error_message}
+                                </p>
+                              )}
+                          </div>
+                        </div>
+                      )}
+
                     <Button
-                      size="sm"
-                      color="secondary"
-                      variant="flat"
-                      isLoading={pullSubscriptionMutation.isPending}
-                      onPress={() =>
-                        pullSubscriptionMutation.mutate(currentSubscription.id)
-                      }
                       className="mt-2"
+                      color="secondary"
+                      isLoading={
+                        pullingSubscriptionId === currentSubscription.id
+                      }
+                      isDisabled={
+                        pullSubscriptionMutation.isPending ||
+                        pullingSubscriptionId === currentSubscription.id
+                      }
+                      size="sm"
+                      variant="flat"
+                      onPress={() => {
+                        console.log("[手动拉取] 开始拉取订阅:", currentSubscription.id);
+                        pullSubscriptionMutation.mutate(currentSubscription.id);
+                      }}
                     >
-                      手动拉取
+                      {pullingSubscriptionId === currentSubscription.id
+                        ? "拉取中..."
+                        : "手动拉取"}
                     </Button>
                   </div>
                 </div>
@@ -429,10 +604,10 @@ const FofaScanPage: React.FC = () => {
             {isLoading ? (
               <div className="flex flex-col gap-2 justify-center items-center h-32">
                 <Progress
-                  size="sm"
                   isIndeterminate
                   aria-label="加载中..."
                   className="max-w-md"
+                  size="sm"
                 />
                 <p className="text-sm text-default-500">加载中...</p>
               </div>
@@ -449,8 +624,8 @@ const FofaScanPage: React.FC = () => {
                   <TableColumn>错误信息</TableColumn>
                 </TableHeader>
                 <TableBody
-                  items={scanHistory || []}
                   emptyContent="暂无扫描记录"
+                  items={scanHistory || []}
                 >
                   {(scan) => (
                     <TableRow key={scan.id}>
