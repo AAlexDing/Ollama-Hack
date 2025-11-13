@@ -1,8 +1,8 @@
-version: '3.8'
+version: "3.8"
 
 services:
   frontend:
-    image: timlzh/ollama-hack-frontend:latest
+    image: dingggg/ollama-hack-frontend:latest
     # image: ghcr.io/timlzh/ollama-hack-frontend:latest
     ports:
       - "3000:80"
@@ -13,7 +13,7 @@ services:
       - app-network
 
   backend:
-    image: timlzh/ollama-hack-backend:latest
+    image: dingggg/ollama-hack-backend:latest
     # image: ghcr.io/timlzh/ollama-hack-backend:latest
     environment:
       - APP__ENV=prod
