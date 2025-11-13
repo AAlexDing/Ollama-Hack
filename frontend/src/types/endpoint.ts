@@ -20,12 +20,22 @@ export interface EndpointPerformanceInfo {
   created_at: string;
 }
 
+// AI模型摘要信息（用于列表显示）
+export interface EndpointAIModelSummary {
+  name: string;
+  tag: string;
+  status: string; // 模型状态：available, unavailable, missing, fake等
+}
+
 // 带 AI 模型数量的端点信息
 export interface EndpointWithAIModelCount extends EndpointInfo {
   recent_performances: EndpointPerformanceInfo[];
   total_ai_model_count: number;
   avaliable_ai_model_count: number;
   task_status?: TaskStatusEnum;
+  max_tps?: number | null; // 最大TPS（所有可用模型的TPS最大值）
+  tps_updated_at?: string | null; // TPS更新时间（最新性能测试时间）
+  ai_models?: EndpointAIModelSummary[]; // AI模型列表（用于显示）
 }
 
 // 端点 AI 模型信息

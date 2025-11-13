@@ -107,35 +107,34 @@ const DashboardLayout = ({
       <div className="flex-1 flex flex-col overflow-x-hidden overflow-y-auto">
         {/* 导航栏 */}
         <Navbar isBordered onMenuOpenChange={setIsMenuOpen}>
-          <NavbarContent>
+          <NavbarContent className="navbar-left-content" justify="start">
             <NavbarMenuToggle
               aria-label={isMenuOpen ? "Close menu" : "Open menu"}
               className="sm:hidden"
             />
-            <NavbarBrand>
+            <NavbarBrand className="gap-3">
               <LogoIcon className="w-8 h-8" />
               <h2 className="font-bold">Ollama Hack</h2>
             </NavbarBrand>
+            {current_root_href && (
+              <div className="hidden sm:flex gap-4 ml-6 items-center">
+                {menuItems.map((item) =>
+                  item.adminOnly && !isAdmin ? null : (
+                    <NavbarItem
+                      key={item.href}
+                      isActive={item.href === current_root_href}
+                    >
+                      <Link href={item.href}>
+                        <span>{item.label}</span>
+                      </Link>
+                    </NavbarItem>
+                  )
+                )}
+              </div>
+            )}
           </NavbarContent>
 
-          {current_root_href && (
-            <NavbarContent className="hidden sm:flex gap-4" justify="center">
-              {menuItems.map((item) =>
-                item.adminOnly && !isAdmin ? null : (
-                  <NavbarItem
-                    key={item.href}
-                    isActive={item.href === current_root_href}
-                  >
-                    <Link href={item.href}>
-                      <span>{item.label}</span>
-                    </Link>
-                  </NavbarItem>
-                )
-              )}
-            </NavbarContent>
-          )}
-
-          <NavbarContent as="div" justify="end">
+          <NavbarContent as="div" className="navbar-right-content" justify="end">
             {/* 大屏幕下显示的主题切换开关 */}
             <div className="hidden sm:flex mr-4">
               <ThemeSwitch />

@@ -61,11 +61,32 @@ class OllamaClient:
             method, path, *args, json=json, ssl=False, **kwargs
         ) as response:
             if response.status >= 300 or response.status < 200:
+                # 尝试读取响应体中的错误信息
+                error_message = f"Error fetching {path}: {response.reason}"
+                try:
+                    error_body = await response.text()
+                    if error_body:
+                        try:
+                            error_json = json_lib.loads(error_body)
+                            if isinstance(error_json, dict):
+                                if "error" in error_json:
+                                    error_message = f"Error: {error_json['error']}"
+                                elif "message" in error_json:
+                                    error_message = f"Error: {error_json['message']}"
+                                else:
+                                    error_message = f"Error: {error_body[:500]}"
+                            else:
+                                error_message = f"Error: {error_body[:500]}"
+                        except json_lib.JSONDecodeError:
+                            error_message = f"Error: {error_body[:500]}"
+                except Exception as e:
+                    logger.debug(f"Failed to read error response body: {e}")
+                
                 raise aiohttp.ClientResponseError(
                     request_info=response.request_info,
                     history=response.history,
                     status=response.status,
-                    message=f"Error fetching {path}: {response.reason}",
+                    message=error_message,
                 )
             return await response.content.read()
 
@@ -82,11 +103,32 @@ class OllamaClient:
             method, path, *args, json=json, ssl=False, **kwargs
         ) as response:
             if response.status >= 300 or response.status < 200:
+                # 尝试读取响应体中的错误信息
+                error_message = f"Error fetching {path}: {response.reason}"
+                try:
+                    error_body = await response.text()
+                    if error_body:
+                        try:
+                            error_json = json_lib.loads(error_body)
+                            if isinstance(error_json, dict):
+                                if "error" in error_json:
+                                    error_message = f"Error: {error_json['error']}"
+                                elif "message" in error_json:
+                                    error_message = f"Error: {error_json['message']}"
+                                else:
+                                    error_message = f"Error: {error_body[:500]}"
+                            else:
+                                error_message = f"Error: {error_body[:500]}"
+                        except json_lib.JSONDecodeError:
+                            error_message = f"Error: {error_body[:500]}"
+                except Exception as e:
+                    logger.debug(f"Failed to read error response body: {e}")
+                
                 raise aiohttp.ClientResponseError(
                     request_info=response.request_info,
                     history=response.history,
                     status=response.status,
-                    message=f"Error fetching {path}: {response.reason}",
+                    message=error_message,
                 )
             
             # 流式处理（SSE 格式或逐行 JSON）

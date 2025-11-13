@@ -112,18 +112,22 @@ const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     setIsSubmitting(true);
 
     try {
-      // 分割 URL 并过滤空行
-      const urlLines = urls
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line);
+      // 分割 URL 并过滤空行，然后去重
+      const urlLines = Array.from(
+        new Set(
+          urls
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line)
+        )
+      );
 
       if (urlLines.length === 0) {
         throw new Error("请输入至少一个有效的端点 URL");
       }
 
-      // 处理批量创建
-      const endpoints: EndpointCreate[] = urlLines.map((url) => {
+      // 处理批量创建，先处理 URL 格式，然后去重
+      const processedEndpoints: EndpointCreate[] = urlLines.map((url) => {
         // 确保 URL 格式正确
         let processedUrl = url;
 
@@ -146,6 +150,15 @@ const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
         };
       });
 
+      // 按 URL 去重（处理后的 URL 可能重复）
+      const uniqueEndpointsMap = new Map<string, EndpointCreate>();
+      processedEndpoints.forEach((ep) => {
+        if (!uniqueEndpointsMap.has(ep.url)) {
+          uniqueEndpointsMap.set(ep.url, ep);
+        }
+      });
+      const endpoints = Array.from(uniqueEndpointsMap.values());
+
       // 提交批量创建请求
       await endpointApi.batchCreateEndpoints({
         endpoints,
@@ -153,8 +166,10 @@ const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
       // 设置成功消息并清空表单
       addToast({
-        title: `成功创建 ${endpoints.length} 个端点`,
+        title: `批量创建端点请求已提交`,
+        description: `已处理 ${endpoints.length} 个唯一端点（后端会自动跳过已存在的端点）`,
         color: "success",
+        duration: 4000,
       });
       setUrls("");
       handleClose();

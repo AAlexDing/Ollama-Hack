@@ -287,6 +287,7 @@ export const DataTable = <T extends { id?: number | string }>({
                 <Button
                   color="primary"
                   isIconOnly={addButtonProps.isIconOnly || false}
+                  size={addButtonProps.isIconOnly ? undefined : "md"}
                   onPress={addButtonProps.onClick}
                 >
                   {addButtonProps.label || <PlusIcon />}

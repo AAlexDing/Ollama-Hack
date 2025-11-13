@@ -16,6 +16,8 @@ class EndpointSortField(StrEnum):
     NAME = "name"
     CREATED_AT = "created_at"
     STATUS = "status"
+    MAX_TPS = "max_tps"
+    TPS_UPDATED_AT = "tps_updated_at"
 
 
 class EndpointFilterParams(FilterParams[EndpointSortField]):
@@ -95,10 +97,23 @@ class EndpointWithAIModels(EndpointWithPerformance):
         from_attributes = True
 
 
+class EndpointAIModelSummary(BaseModel):
+    """端点AI模型摘要信息（用于列表显示）"""
+    name: str
+    tag: str
+    status: str  # 模型状态：available, unavailable, missing, fake等
+
+    class Config:
+        from_attributes = True
+
+
 class EndpointWithAIModelCount(EndpointWithPerformance):
     total_ai_model_count: int
     avaliable_ai_model_count: int
     task_status: Optional[TaskStatus] = None
+    max_tps: Optional[float] = None  # 最大TPS（所有可用模型的TPS最大值）
+    tps_updated_at: Optional[datetime] = None  # TPS更新时间（最新性能测试时间）
+    ai_models: List[EndpointAIModelSummary] = []  # AI模型列表（用于显示）
 
     class Config:
         from_attributes = True

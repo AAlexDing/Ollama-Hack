@@ -73,6 +73,13 @@ export const endpointApi = {
     );
   },
 
+  // 测试所有端点
+  testAllEndpoints: () => {
+    return apiClient.post<BatchOperationResult>(
+      "/api/v2/endpoint/batch-test/all",
+    );
+  },
+
   // 批量删除端点
   batchDeleteEndpoints: (data: EndpointBatchOperation) => {
     return apiClient.delete<BatchOperationResult>("/api/v2/endpoint/batch", {

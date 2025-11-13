@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import BackgroundTasks, Depends, HTTPException, status
 from fastapi_pagination import Page, Params, set_page
 from fastapi_pagination.ext.sqlmodel import paginate as apaginate
-from sqlalchemy import func, insert
+from sqlalchemy import and_, func, insert
 from sqlalchemy.orm import selectinload
 from sqlmodel import col, or_, select
 
@@ -27,7 +27,9 @@ from .models import (
 from .schemas import (
     BatchOperationResult,
     EndpointAIModelInfo,
+    EndpointAIModelSummary,
     EndpointBatchCreate,
+    EndpointSortField,
     EndpointBatchOperation,
     EndpointCreateWithName,
     EndpointFilterParams,
@@ -75,14 +77,13 @@ async def batch_create_or_update_endpoints(
     )
     existing = {row[0]: row[1] for row in result.all()}
 
-    # 2. 过滤出未存在的 URL
-    new_urls = [url for url in urls if url not in existing]
+    # 2. 过滤出未存在的 URL，并去重输入列表本身
+    new_urls = list(set([url for url in urls if url not in existing]))
 
     # 3. 批量插入新 URL
     new_ids = []
     if new_urls:
         # 构建插入数据
-        new_urls = list(set(urls))
         to_insert = [{"url": url, "name": url} for url in new_urls]
         await session.execute(insert(EndpointDB).values(to_insert))
         await session.commit()
@@ -126,19 +127,48 @@ async def get_endpoints(
     Get all endpoints with filtering, searching and sorting.
 
     params:
-        - search: Optional search string for name or URL
+        - search: Optional search string for AI model name or tag (filters endpoints containing matching models)
         - order_by: Field to sort by
         - order: Sort order (asc or desc)
     """
     set_page(Page[EndpointDB])
     query = select(EndpointDB).options(selectinload(EndpointDB.performances))  # type: ignore
 
-    # 添加搜索条件
+    # 添加搜索条件：搜索模型名称或tag，过滤出包含这些模型的端点
     if params.search:
-        search_term = f"%{params.search}%"
-        query = query.where(
-            or_(col(EndpointDB.name).ilike(search_term), col(EndpointDB.url).ilike(search_term))
-        )
+        # 支持 "name:tag" 格式的搜索
+        if ":" in params.search:
+            model_name, model_tag = params.search.split(":", 1)
+            model_query = select(AIModelDB.id).where(
+                and_(
+                    col(AIModelDB.name).ilike(f"%{model_name}%"),
+                    col(AIModelDB.tag).ilike(f"%{model_tag}%"),
+                )
+            )
+        else:
+            search_term = f"%{params.search}%"
+            model_query = select(AIModelDB.id).where(
+                or_(col(AIModelDB.name).ilike(search_term), col(AIModelDB.tag).ilike(search_term))
+            )
+        model_result = await session.execute(model_query)
+        matching_model_ids = [row[0] for row in model_result.all()]
+        
+        if matching_model_ids:
+            # 找到包含这些模型的端点ID
+            endpoint_query = select(EndpointAIModelDB.endpoint_id).where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids)
+            ).distinct()
+            endpoint_result = await session.execute(endpoint_query)
+            matching_endpoint_ids = [row[0] for row in endpoint_result.all()]
+            
+            if matching_endpoint_ids:
+                query = query.where(EndpointDB.id.in_(matching_endpoint_ids))
+            else:
+                # 没有找到包含匹配模型的端点，返回空结果
+                query = query.where(EndpointDB.id == -1)  # 永远不匹配的条件
+        else:
+            # 没有找到匹配的模型，返回空结果
+            query = query.where(EndpointDB.id == -1)  # 永远不匹配的条件
 
     # 添加排序
     if params.order_by:
@@ -564,7 +594,470 @@ async def get_endpoints_with_ai_model_counts(
     """
     Get all endpoints with AI model counts, with support for filtering, searching and sorting.
     """
+    # 先获取端点列表（如果按TPS排序，需要特殊处理）
+    need_custom_sort = filter_params.order_by in (EndpointSortField.MAX_TPS, EndpointSortField.TPS_UPDATED_AT)
+    
+    # 保存匹配的模型ID（用于后续过滤AI模型列表和计算TPS）
+    matching_model_ids_for_filter: list[int] | None = None
+    
+    if need_custom_sort:
+        # 对于TPS排序，先获取所有匹配的端点ID（不分页，但应用过滤条件）
+        base_query = select(EndpointDB.id)
+        
+        # 添加搜索条件：搜索模型名称或tag，过滤出包含这些模型的端点
+        if filter_params.search:
+            # 支持 "name:tag" 格式的搜索
+            if ":" in filter_params.search:
+                model_name, model_tag = filter_params.search.split(":", 1)
+                model_query = select(AIModelDB.id).where(
+                    and_(
+                        col(AIModelDB.name).ilike(f"%{model_name}%"),
+                        col(AIModelDB.tag).ilike(f"%{model_tag}%"),
+                    )
+                )
+            else:
+                search_term = f"%{filter_params.search}%"
+                model_query = select(AIModelDB.id).where(
+                    or_(col(AIModelDB.name).ilike(search_term), col(AIModelDB.tag).ilike(search_term))
+                )
+            model_result = await session.execute(model_query)
+            matching_model_ids_for_filter = [row[0] for row in model_result.all()]
+            
+            if matching_model_ids_for_filter:
+                # 找到包含这些模型的端点ID
+                endpoint_query = select(EndpointAIModelDB.endpoint_id).where(
+                    EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter)
+                ).distinct()
+                endpoint_result = await session.execute(endpoint_query)
+                matching_endpoint_ids = [row[0] for row in endpoint_result.all()]
+                
+                if matching_endpoint_ids:
+                    base_query = base_query.where(EndpointDB.id.in_(matching_endpoint_ids))
+                else:
+                    # 没有找到包含匹配模型的端点，返回空结果
+                    base_query = base_query.where(EndpointDB.id == -1)  # 永远不匹配的条件
+            else:
+                # 没有找到匹配的模型，返回空结果
+                base_query = base_query.where(EndpointDB.id == -1)  # 永远不匹配的条件
+        
+        if filter_params.status:
+            base_query = base_query.where(EndpointDB.status == filter_params.status)
+        
+        result = await session.execute(base_query)
+        endpoint_ids = [row[0] for row in result.all()]
+        
+        if not endpoint_ids:
+            return Page(items=[], total=0, page=filter_params.page, size=filter_params.size, pages=0)
+        
+        # 批量查询所有需要的数据
+        from src.ai_model.models import AIModelPerformanceDB
+        
+        # 批量查询：AI模型数量统计（分两次查询更兼容）
+        # 如果有搜索条件，只统计匹配的模型
+        # 总数量
+        total_count_query = (
+            select(
+                EndpointAIModelDB.endpoint_id,
+                func.count().label('total')
+            )
+            .where(EndpointAIModelDB.endpoint_id.in_(endpoint_ids))
+        )
+        if matching_model_ids_for_filter:
+            total_count_query = total_count_query.where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter)
+            )
+        total_count_query = total_count_query.group_by(EndpointAIModelDB.endpoint_id)
+        total_count_result = await session.execute(total_count_query)
+        total_count_dict = {row[0]: row[1] or 0 for row in total_count_result.all()}
+        
+        # 可用数量
+        available_count_query = (
+            select(
+                EndpointAIModelDB.endpoint_id,
+                func.count().label('available')
+            )
+            .where(
+                EndpointAIModelDB.endpoint_id.in_(endpoint_ids),
+                EndpointAIModelDB.status == AIModelStatusEnum.AVAILABLE
+            )
+        )
+        if matching_model_ids_for_filter:
+            available_count_query = available_count_query.where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter)
+            )
+        available_count_query = available_count_query.group_by(EndpointAIModelDB.endpoint_id)
+        available_count_result = await session.execute(available_count_query)
+        available_count_dict = {row[0]: row[1] or 0 for row in available_count_result.all()}
+        
+        # 合并结果
+        model_counts_dict = {
+            ep_id: {
+                'total': total_count_dict.get(ep_id, 0),
+                'available': available_count_dict.get(ep_id, 0)
+            }
+            for ep_id in endpoint_ids
+        }
+        
+        # 批量查询：最大TPS（如果有搜索条件，只考虑匹配的模型）
+        max_tps_query = (
+            select(
+                EndpointAIModelDB.endpoint_id,
+                func.max(EndpointAIModelDB.token_per_second).label('max_tps')
+            )
+            .where(
+                EndpointAIModelDB.endpoint_id.in_(endpoint_ids),
+                EndpointAIModelDB.status == AIModelStatusEnum.AVAILABLE,
+                EndpointAIModelDB.token_per_second > 0
+            )
+        )
+        # 如果有搜索条件，只考虑匹配的模型
+        if matching_model_ids_for_filter:
+            max_tps_query = max_tps_query.where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter)
+            )
+        max_tps_query = max_tps_query.group_by(EndpointAIModelDB.endpoint_id)
+        max_tps_result = await session.execute(max_tps_query)
+        max_tps_dict = {row[0]: (row[1] if row[1] and row[1] > 0 else None) for row in max_tps_result.all()}
+        
+        # 批量查询：TPS更新时间
+        tps_updated_query = (
+            select(
+                AIModelPerformanceDB.endpoint_id,
+                func.max(AIModelPerformanceDB.created_at).label('tps_updated_at')
+            )
+            .where(AIModelPerformanceDB.endpoint_id.in_(endpoint_ids))
+            .group_by(AIModelPerformanceDB.endpoint_id)
+        )
+        tps_updated_result = await session.execute(tps_updated_query)
+        tps_updated_dict = {row[0]: row[1] for row in tps_updated_result.all()}
+        
+        # 批量查询：任务状态（每个端点最新的任务）
+        # 使用子查询获取每个端点最新的任务ID
+        from sqlalchemy import distinct
+        subquery = (
+            select(
+                EndpointTestTask.endpoint_id,
+                func.max(EndpointTestTask.scheduled_at).label('max_scheduled')
+            )
+            .where(EndpointTestTask.endpoint_id.in_(endpoint_ids))
+            .group_by(EndpointTestTask.endpoint_id)
+            .subquery()
+        )
+        task_query = (
+            select(
+                EndpointTestTask.endpoint_id,
+                EndpointTestTask.status
+            )
+            .join(subquery, 
+                  (EndpointTestTask.endpoint_id == subquery.c.endpoint_id) &
+                  (EndpointTestTask.scheduled_at == subquery.c.max_scheduled))
+            .where(EndpointTestTask.endpoint_id.in_(endpoint_ids))
+        )
+        task_result = await session.execute(task_query)
+        task_status_dict = {row[0]: row[1] for row in task_result.all()}
+        
+        # 批量查询：AI模型列表（名称、tag、状态）
+        # 如果有搜索条件，只返回匹配的模型
+        ai_models_query = (
+            select(
+                EndpointAIModelDB.endpoint_id,
+                AIModelDB.name,
+                AIModelDB.tag,
+                EndpointAIModelDB.status
+            )
+            .join(AIModelDB, EndpointAIModelDB.ai_model_id == AIModelDB.id)
+            .where(EndpointAIModelDB.endpoint_id.in_(endpoint_ids))
+        )
+        if matching_model_ids_for_filter:
+            ai_models_query = ai_models_query.where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter)
+            )
+        ai_models_query = ai_models_query.order_by(EndpointAIModelDB.endpoint_id, AIModelDB.name, AIModelDB.tag)
+        ai_models_result = await session.execute(ai_models_query)
+        # 按端点ID分组
+        ai_models_dict: dict[int, list[dict]] = {}
+        for row in ai_models_result.all():
+            ep_id, name, tag, status = row
+            if ep_id not in ai_models_dict:
+                ai_models_dict[ep_id] = []
+            ai_models_dict[ep_id].append({
+                'name': name,
+                'tag': tag,
+                'status': status.value if hasattr(status, 'value') else str(status)
+            })
+        
+        # 获取端点详细信息（只获取需要的端点）
+        endpoints_query = (
+            select(EndpointDB)
+            .options(selectinload(EndpointDB.performances))
+            .where(EndpointDB.id.in_(endpoint_ids))
+        )
+        endpoints_result = await session.execute(endpoints_query)
+        all_endpoints = list(endpoints_result.scalars().all())
+        
+        # 构建端点数据并计算TPS（用于排序）
+        endpoints_with_data = []
+        for endpoint in all_endpoints:
+            endpoint_id = endpoint.id
+            if endpoint_id is None:
+                continue
+                
+            model_info = model_counts_dict.get(endpoint_id, {'total': 0, 'available': 0})
+            max_tps = max_tps_dict.get(endpoint_id)
+            tps_updated_at = tps_updated_dict.get(endpoint_id)
+            task_status = task_status_dict.get(endpoint_id)
+            
+            endpoints_with_data.append({
+                'endpoint': endpoint,
+                'total_count': model_info['total'],
+                'available_count': model_info['available'],
+                'max_tps': max_tps,
+                'tps_updated_at': tps_updated_at,
+                'task_status': task_status,
+            })
+        
+        # 在Python层面排序
+        # 无论升序还是降序，有值的端点都应该排在前面，None值的排在后面
+        def sort_key(item):
+            if filter_params.order_by == EndpointSortField.MAX_TPS:
+                max_tps = item['max_tps']
+                if max_tps is None:
+                    # None值：返回一个很大的数，确保无论升序降序都排在最后
+                    # 对于升序：大值在后；对于降序：由于reverse=True，大值也在后
+                    return float('inf')
+                else:
+                    # 有值：返回实际的TPS值
+                    return max_tps
+            elif filter_params.order_by == EndpointSortField.TPS_UPDATED_AT:
+                tps_updated_at = item['tps_updated_at']
+                if tps_updated_at is None:
+                    # None值：返回一个很远的未来时间，确保排在最后
+                    return datetime.max
+                else:
+                    # 有值：返回实际时间
+                    return tps_updated_at
+            return None
+        
+        # 排序：先分离有值和None值的端点
+        has_value = [item for item in endpoints_with_data if sort_key(item) not in (float('inf'), datetime.max)]
+        has_none = [item for item in endpoints_with_data if sort_key(item) in (float('inf'), datetime.max)]
+        
+        # 对有值的端点进行排序
+        reverse = filter_params.order == SortOrder.DESC
+        has_value.sort(key=sort_key, reverse=reverse)
+        
+        # 合并：有值的在前，None值的在后
+        endpoints_with_data = has_value + has_none
+        
+        # 应用分页
+        total = len(endpoints_with_data)
+        page = filter_params.page
+        size = filter_params.size
+        start = (page - 1) * size
+        end = start + size
+        paginated_data = endpoints_with_data[start:end]
+        
+        # 转换分页后的数据
+        endpoints_with_counts = []
+        for item in paginated_data:
+            endpoint = item['endpoint']
+            recent_performances = endpoint.performances[:1] if endpoint.performances else []
+            endpoint_performances = [
+                EndpointPerformanceInfo(
+                    id=perf.id,
+                    status=perf.status,
+                    ollama_version=perf.ollama_version,
+                    created_at=perf.created_at,
+                )
+                for perf in recent_performances
+            ]
+            
+            # 获取AI模型列表
+            endpoint_id = endpoint.id
+            ai_models_list = ai_models_dict.get(endpoint_id, [])
+            ai_models_summary = [
+                EndpointAIModelSummary(
+                    name=model['name'],
+                    tag=model['tag'],
+                    status=model['status']
+                )
+                for model in ai_models_list
+            ]
+            
+            endpoints_with_counts.append(
+                EndpointWithAIModelCount(
+                    id=endpoint.id,
+                    url=endpoint.url,
+                    name=endpoint.name,
+                    created_at=endpoint.created_at,
+                    status=endpoint.status,
+                    recent_performances=endpoint_performances,
+                    total_ai_model_count=item['total_count'],
+                    avaliable_ai_model_count=item['available_count'],
+                    task_status=item['task_status'],
+                    max_tps=item['max_tps'],
+                    tps_updated_at=item['tps_updated_at'],
+                    ai_models=ai_models_summary,
+                )
+            )
+        
+        pages = (total + size - 1) // size if size > 0 else 1
+        return Page(
+            items=endpoints_with_counts,
+            total=total,
+            page=page,
+            size=size,
+            pages=pages,
+        )
+    
+    # 非TPS排序的情况，使用原有逻辑
+    # 先获取匹配的模型ID（如果有搜索条件）
+    matching_model_ids_for_filter_normal: list[int] | None = None
+    if filter_params.search:
+        if ":" in filter_params.search:
+            model_name, model_tag = filter_params.search.split(":", 1)
+            model_query = select(AIModelDB.id).where(
+                and_(
+                    col(AIModelDB.name).ilike(f"%{model_name}%"),
+                    col(AIModelDB.tag).ilike(f"%{model_tag}%"),
+                )
+            )
+        else:
+            search_term = f"%{filter_params.search}%"
+            model_query = select(AIModelDB.id).where(
+                or_(col(AIModelDB.name).ilike(search_term), col(AIModelDB.tag).ilike(search_term))
+            )
+        model_result = await session.execute(model_query)
+        matching_model_ids_for_filter_normal = [row[0] for row in model_result.all()]
+    
     endpoints_page = await get_endpoints(session, filter_params)
+
+    # 批量查询AI模型列表（用于非TPS排序的情况）
+    # 如果有搜索条件，只返回匹配的模型
+    endpoint_ids_normal = [ep.id for ep in endpoints_page.items if ep.id is not None]
+    ai_models_dict_normal: dict[int, list[dict]] = {}
+    if endpoint_ids_normal:
+        ai_models_query_normal = (
+            select(
+                EndpointAIModelDB.endpoint_id,
+                AIModelDB.name,
+                AIModelDB.tag,
+                EndpointAIModelDB.status
+            )
+            .join(AIModelDB, EndpointAIModelDB.ai_model_id == AIModelDB.id)
+            .where(EndpointAIModelDB.endpoint_id.in_(endpoint_ids_normal))
+        )
+        if matching_model_ids_for_filter_normal:
+            ai_models_query_normal = ai_models_query_normal.where(
+                EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter_normal)
+            )
+        ai_models_query_normal = ai_models_query_normal.order_by(EndpointAIModelDB.endpoint_id, AIModelDB.name, AIModelDB.tag)
+        ai_models_result_normal = await session.execute(ai_models_query_normal)
+        for row in ai_models_result_normal.all():
+            ep_id, name, tag, status = row
+            if ep_id not in ai_models_dict_normal:
+                ai_models_dict_normal[ep_id] = []
+            ai_models_dict_normal[ep_id].append({
+                'name': name,
+                'tag': tag,
+                'status': status.value if hasattr(status, 'value') else str(status)
+            })
+
+    # 批量查询所有需要的数据（优化：避免N+1查询问题）
+    if not endpoint_ids_normal:
+        return Page(items=[], total=endpoints_page.total, page=endpoints_page.page, size=endpoints_page.size, pages=endpoints_page.pages)
+    
+    from src.ai_model.models import AIModelPerformanceDB
+    
+    # 批量查询：模型数量统计
+    total_count_query = (
+        select(
+            EndpointAIModelDB.endpoint_id,
+            func.count().label('total')
+        )
+        .where(EndpointAIModelDB.endpoint_id.in_(endpoint_ids_normal))
+    )
+    if matching_model_ids_for_filter_normal:
+        total_count_query = total_count_query.where(
+            EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter_normal)
+        )
+    total_count_query = total_count_query.group_by(EndpointAIModelDB.endpoint_id)
+    total_count_result = await session.execute(total_count_query)
+    total_count_dict = {row[0]: row[1] or 0 for row in total_count_result.all()}
+    
+    available_count_query = (
+        select(
+            EndpointAIModelDB.endpoint_id,
+            func.count().label('available')
+        )
+        .where(
+            EndpointAIModelDB.endpoint_id.in_(endpoint_ids_normal),
+            EndpointAIModelDB.status == AIModelStatusEnum.AVAILABLE
+        )
+    )
+    if matching_model_ids_for_filter_normal:
+        available_count_query = available_count_query.where(
+            EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter_normal)
+        )
+    available_count_query = available_count_query.group_by(EndpointAIModelDB.endpoint_id)
+    available_count_result = await session.execute(available_count_query)
+    available_count_dict = {row[0]: row[1] or 0 for row in available_count_result.all()}
+    
+    # 批量查询：最大TPS
+    max_tps_query = (
+        select(
+            EndpointAIModelDB.endpoint_id,
+            func.max(EndpointAIModelDB.token_per_second).label('max_tps')
+        )
+        .where(
+            EndpointAIModelDB.endpoint_id.in_(endpoint_ids_normal),
+            EndpointAIModelDB.status == AIModelStatusEnum.AVAILABLE,
+            EndpointAIModelDB.token_per_second > 0
+        )
+    )
+    if matching_model_ids_for_filter_normal:
+        max_tps_query = max_tps_query.where(
+            EndpointAIModelDB.ai_model_id.in_(matching_model_ids_for_filter_normal)
+        )
+    max_tps_query = max_tps_query.group_by(EndpointAIModelDB.endpoint_id)
+    max_tps_result = await session.execute(max_tps_query)
+    max_tps_dict = {row[0]: (row[1] if row[1] and row[1] > 0 else None) for row in max_tps_result.all()}
+    
+    # 批量查询：TPS更新时间
+    tps_updated_query = (
+        select(
+            AIModelPerformanceDB.endpoint_id,
+            func.max(AIModelPerformanceDB.created_at).label('tps_updated_at')
+        )
+        .where(AIModelPerformanceDB.endpoint_id.in_(endpoint_ids_normal))
+        .group_by(AIModelPerformanceDB.endpoint_id)
+    )
+    tps_updated_result = await session.execute(tps_updated_query)
+    tps_updated_dict = {row[0]: row[1] for row in tps_updated_result.all()}
+    
+    # 批量查询：任务状态
+    from sqlalchemy import distinct
+    task_subquery = (
+        select(
+            EndpointTestTask.endpoint_id,
+            func.max(EndpointTestTask.scheduled_at).label('max_scheduled')
+        )
+        .where(EndpointTestTask.endpoint_id.in_(endpoint_ids_normal))
+        .group_by(EndpointTestTask.endpoint_id)
+        .subquery()
+    )
+    task_query = (
+        select(
+            EndpointTestTask.endpoint_id,
+            EndpointTestTask.status
+        )
+        .join(task_subquery, 
+              (EndpointTestTask.endpoint_id == task_subquery.c.endpoint_id) &
+              (EndpointTestTask.scheduled_at == task_subquery.c.max_scheduled))
+        .where(EndpointTestTask.endpoint_id.in_(endpoint_ids_normal))
+    )
+    task_result = await session.execute(task_query)
+    task_status_dict = {row[0]: row[1] for row in task_result.all()}
 
     endpoints_with_counts = []
 
@@ -581,29 +1074,27 @@ async def get_endpoints_with_ai_model_counts(
             for perf in recent_performances
         ]
 
-        # Count total AI models
-        query = select(func.count()).where(EndpointAIModelDB.endpoint_id == endpoint.id)
-        result = await session.execute(query)
-        total_ai_model_count = result.scalar_one()
+        endpoint_id = endpoint.id
+        if endpoint_id is None:
+            continue
 
-        # Count available AI models
-        query = select(func.count()).where(
-            EndpointAIModelDB.endpoint_id == endpoint.id,
-            EndpointAIModelDB.status == AIModelStatusEnum.AVAILABLE,
-        )
-        result = await session.execute(query)
-        avaliable_ai_model_count = result.scalar_one()
+        # 从批量查询结果中获取数据
+        total_ai_model_count = total_count_dict.get(endpoint_id, 0)
+        avaliable_ai_model_count = available_count_dict.get(endpoint_id, 0)
+        max_tps = max_tps_dict.get(endpoint_id)
+        tps_updated_at = tps_updated_dict.get(endpoint_id)
+        task_status = task_status_dict.get(endpoint_id)
 
-        query = (
-            select(EndpointTestTask)
-            .where(
-                EndpointTestTask.endpoint_id == endpoint.id,
+        # 获取AI模型列表
+        ai_models_list = ai_models_dict_normal.get(endpoint_id, [])
+        ai_models_summary = [
+            EndpointAIModelSummary(
+                name=model['name'],
+                tag=model['tag'],
+                status=model['status']
             )
-            .order_by(col(EndpointTestTask.scheduled_at).desc())
-        )
-        result = await session.execute(query)
-        task = result.scalars().first()
-        task_status = task.status if task else None
+            for model in ai_models_list
+        ]
 
         # Create the endpoint with counts
         endpoints_with_counts.append(
@@ -617,10 +1108,13 @@ async def get_endpoints_with_ai_model_counts(
                 total_ai_model_count=total_ai_model_count,
                 avaliable_ai_model_count=avaliable_ai_model_count,
                 task_status=task_status,
+                max_tps=max_tps,
+                tps_updated_at=tps_updated_at,
+                ai_models=ai_models_summary,
             )
         )
 
-    # Return paginated results
+    # 对于非TPS排序的情况，直接返回结果
     return Page(
         items=endpoints_with_counts,
         total=endpoints_page.total,
@@ -791,6 +1285,37 @@ async def batch_test_endpoints(
         failed_count=len(batch_operation.endpoint_ids) - success_count,
         failed_ids=failed_ids,
     )
+
+
+async def test_all_endpoints(
+    session: DBSessionDep,
+    background_task: BackgroundTasks,
+) -> BatchOperationResult:
+    """
+    Test all endpoints.
+
+    Args:
+        session: Database session
+        background_task: FastAPI background tasks
+
+    Returns:
+        BatchOperationResult with success and failure counts
+    """
+    # 获取所有端点的ID
+    query = select(EndpointDB.id)
+    result = await session.execute(query)
+    all_endpoint_ids = [row[0] for row in result.all() if row[0] is not None]
+
+    if not all_endpoint_ids:
+        return BatchOperationResult(
+            success_count=0,
+            failed_count=0,
+            failed_ids={},
+        )
+
+    # 使用批量测试函数
+    batch_operation = EndpointBatchOperation(endpoint_ids=all_endpoint_ids)
+    return await batch_test_endpoints(session, background_task, batch_operation)
 
 
 async def batch_delete_endpoints(

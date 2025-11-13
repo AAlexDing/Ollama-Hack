@@ -37,7 +37,7 @@ const EndpointListPage = () => {
       pageSize: { min: 5, max: 100 },
       totalPages: 1,
       orderBy: {
-        allowedFields: ["id", "name", "status", "created_at"],
+        allowedFields: ["id", "name", "status", "created_at", "max_tps", "tps_updated_at"],
         defaultField: "id",
       },
     });
@@ -59,8 +59,8 @@ const EndpointListPage = () => {
       page: 1,
       pageSize: 10,
       search: "",
-      orderBy: "status",
-      order: SortOrder.ASC,
+      orderBy: "max_tps",
+      order: SortOrder.DESC,
     },
     validationConfig,
   );
@@ -83,6 +83,8 @@ const EndpointListPage = () => {
     // "url",
     "status",
     "models",
+    "max_tps",
+    "tps_updated_at",
     // "created_at",
     "actions",
   ];
@@ -205,6 +207,47 @@ const EndpointListPage = () => {
         }
       },
       "确认批量测试端点",
+    );
+  };
+
+  // 处理测试所有端点
+  const handleTestAllEndpoints = () => {
+    const totalCount = endpoints?.total || 0;
+    
+    confirm(
+      `确定要测试所有 ${totalCount} 个端点吗？`,
+      async () => {
+        try {
+          const result = await endpointApi.testAllEndpoints();
+
+          // 标记当前页面的端点为测试中
+          // 其他端点的状态会通过轮询机制自动更新
+          const currentPageEndpointIds = endpoints?.items
+            .map((ep) => ep.id)
+            .filter((id): id is number => id !== undefined) || [];
+          
+          setTestingEndpointIds((prev) => {
+            const newTestingIds = new Set([...prev, ...currentPageEndpointIds]);
+            return Array.from(newTestingIds);
+          });
+
+          addToast({
+            title: "测试所有端点已触发",
+            description: `成功: ${result.success_count}, 失败: ${result.failed_count}`,
+            color: "primary",
+          });
+
+          // 刷新列表以获取最新状态
+          refetch();
+        } catch (err) {
+          addToast({
+            title: "测试所有端点失败",
+            description: (err as Error).message || "请重试",
+            color: "danger",
+          });
+        }
+      },
+      "确认测试所有端点",
     );
   };
 
@@ -463,6 +506,7 @@ const EndpointListPage = () => {
           onSearch={handleSearch}
           onSelectionChange={handleSelectionChange}
           onTestEndpoint={handleTestEndpoint}
+          onTestAllEndpoints={handleTestAllEndpoints}
         />
       )}
 

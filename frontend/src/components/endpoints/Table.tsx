@@ -1,5 +1,6 @@
 import React from "react";
 import { Button } from "@heroui/button";
+import { Chip } from "@heroui/chip";
 import { SortDescriptor, Selection, Key } from "@heroui/table";
 import { Tooltip } from "@heroui/tooltip";
 import { Spinner } from "@heroui/spinner";
@@ -41,6 +42,7 @@ interface EndpointTableProps {
   onPageChange: (page: number) => void;
   onSearch: (e: React.FormEvent) => void;
   onTestEndpoint: (id: number) => void;
+  onTestAllEndpoints?: () => void;
   isAdmin: boolean;
   totalPages?: number;
   totalItems?: number;
@@ -73,6 +75,7 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
   onPageChange,
   onSearch,
   onTestEndpoint,
+  onTestAllEndpoints,
   isAdmin,
   totalPages,
   totalItems,
@@ -82,6 +85,11 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
   onSelectionChange,
   selectionToolbarContent,
 }) => {
+  // 跟踪每个端点的模型展开/折叠状态
+  const [expandedEndpoints, setExpandedEndpoints] = React.useState<
+    Set<number>
+  >(new Set());
+
   // 获取端点状态
   const getEndpointStatus = (
     endpoint: EndpointWithAIModelCount,
@@ -111,6 +119,8 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
     { key: "url", label: "URL", allowsSorting: true },
     { key: "status", label: "状态", allowsSorting: true },
     { key: "models", label: "AI模型" },
+    { key: "max_tps", label: "TPS", allowsSorting: true },
+    { key: "tps_updated_at", label: "TPS更新时间", allowsSorting: true },
     { key: "created_at", label: "创建时间", allowsSorting: true },
     { key: "actions", label: "操作" },
   ];
@@ -229,12 +239,119 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
       case "status":
         return <StatusBadge status={getEndpointStatus(endpoint)} />;
       case "models":
-        return (
-          <>
-            {endpoint.avaliable_ai_model_count} /{" "}
-            {endpoint.total_ai_model_count}
-          </>
+        const aiModels = endpoint.ai_models || [];
+        if (aiModels.length === 0) {
+          return (
+            <span className="text-default-400 text-sm">
+              {endpoint.avaliable_ai_model_count} / {endpoint.total_ai_model_count}
+            </span>
+          );
+        }
+        
+        // 分离可用模型和需要折叠的模型（不可用、fake、未知）
+        const availableModels = aiModels.filter(
+          (model) => model.status === "available"
         );
+        const hiddenModels = aiModels.filter(
+          (model) =>
+            model.status !== "available" &&
+            model.status !== "unavailable" &&
+            model.status !== "missing" &&
+            model.status !== "fake"
+        );
+        const unavailableModels = aiModels.filter(
+          (model) =>
+            model.status === "unavailable" ||
+            model.status === "missing" ||
+            model.status === "fake"
+        );
+        
+        const endpointId = endpoint.id;
+        const isHovered = endpointId
+          ? expandedEndpoints.has(endpointId)
+          : false;
+        
+        const handleMouseEnter = () => {
+          if (endpointId) {
+            const newExpanded = new Set(expandedEndpoints);
+            newExpanded.add(endpointId);
+            setExpandedEndpoints(newExpanded);
+          }
+        };
+        
+        const handleMouseLeave = () => {
+          if (endpointId) {
+            const newExpanded = new Set(expandedEndpoints);
+            newExpanded.delete(endpointId);
+            setExpandedEndpoints(newExpanded);
+          }
+        };
+        
+        const totalHidden = unavailableModels.length + hiddenModels.length;
+        
+        return (
+          <div
+            className="flex flex-wrap gap-1 w-full"
+            onMouseEnter={handleMouseEnter}
+            onMouseLeave={handleMouseLeave}
+          >
+            {/* 显示可用模型 */}
+            {availableModels.map((model, index) => (
+              <Chip
+                key={`${model.name}-${model.tag}-${index}`}
+                color="success"
+                size="sm"
+                variant="flat"
+                className="font-mono"
+              >
+                {model.name}:{model.tag}
+              </Chip>
+            ))}
+            
+            {/* 显示不可用/fake/未知模型（根据hover状态） */}
+            {isHovered && (
+              <>
+                {unavailableModels.map((model, index) => {
+                  let chipColor: "danger" | "warning" = "danger";
+                  if (model.status === "fake") {
+                    chipColor = "warning"; // 黄色（假/蜜罐）
+                  }
+                  
+                  return (
+                    <Chip
+                      key={`${model.name}-${model.tag}-unavailable-${index}`}
+                      color={chipColor}
+                      size="sm"
+                      variant="flat"
+                      className="font-mono"
+                    >
+                      {model.name}:{model.tag}
+                    </Chip>
+                  );
+                })}
+                {hiddenModels.map((model, index) => (
+                  <Chip
+                    key={`${model.name}-${model.tag}-hidden-${index}`}
+                    color="default"
+                    size="sm"
+                    variant="flat"
+                    className="font-mono"
+                  >
+                    {model.name}:{model.tag}
+                  </Chip>
+                ))}
+              </>
+            )}
+          </div>
+        );
+      case "max_tps":
+        return endpoint.max_tps !== null && endpoint.max_tps !== undefined
+          ? `${endpoint.max_tps.toFixed(2)}`
+          : "-";
+      case "tps_updated_at":
+        return endpoint.tps_updated_at
+          ? new Date(endpoint.tps_updated_at + "Z").toLocaleString()
+          : "-";
       case "created_at":
         return endpoint.created_at
           ? new Date(endpoint.created_at + "Z").toLocaleString()
@@ -260,6 +377,18 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
     }
   };
 
+  // 顶部操作按钮内容
+  const topActionContent = isAdmin && onTestAllEndpoints ? (
+    <Button
+      color="primary"
+      startContent={<TestIcon />}
+      variant="flat"
+      onPress={onTestAllEndpoints}
+    >
+      测试所有端点
+    </Button>
+  ) : undefined;
+
   return (
     <DataTable<EndpointWithAIModelCount>
       key={testingEndpointIds.join(",")}
@@ -274,6 +403,7 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
       }
       columns={columns}
       data={endpoints || []}
+      topActionContent={topActionContent}
       emptyContent={
         <>
           <p className="text-xl">暂无端点数据</p>
@@ -300,7 +430,7 @@ const EndpointTable: React.FC<EndpointTableProps> = ({
       page={page}
       pages={totalPages}
       renderCell={renderCell}
-      searchPlaceholder="搜索端点..."
+      searchPlaceholder="搜索模型..."
       searchTerm={searchTerm}
       selectedKeys={selectedKeys}
       selectedSize={pageSize}

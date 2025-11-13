@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Optional
 
 from aiohttp import ClientResponseError
@@ -144,15 +145,16 @@ async def send_request_to_endpoints(
                     await log_usage(session, 200)
                     return
                 except Exception as e:
-                    logger.error(f"Error: {e}")
+                    logger.error(f"Error sending request to endpoint {endpoint.url}: {type(e).__name__}: {str(e)[:1000]}")
                     error = e
 
             try:
                 raise error
             except ClientResponseError as e:
-                logger.error(f"Error: {e.status} {e.message}")
+                error_msg = str(e.message) if hasattr(e, 'message') else str(e)
+                logger.error(f"Error from endpoint: {e.status} - {error_msg}")
                 await log_usage(session, e.status)
-                yield f"Error: {e.status} {e.message}"
+                yield f"data: {json.dumps({'error': {'message': error_msg, 'status': e.status}})}\n\n"
             except Exception as e:
                 logger.error(f"Error: {e}")
                 await log_usage(session, 500)
@@ -220,20 +222,59 @@ async def request_forwarding(
         get_ai_model_by_name_and_tag,
         get_best_endpoints_for_model,
     )
+    from src.setting.service import get_setting
+    from src.setting.models import SystemSettingKey
+    from src.user.models import UserDB
+    from src.plan.models import PlanDB
 
-    # Get and validate API key
-    api_key, user, plan = await get_api_key_from_request(request_raw, session)
+    # 检查是否禁用 API 鉴权
+    disable_auth = False
+    try:
+        auth_setting = await get_setting(session, SystemSettingKey.DISABLE_OLLAMA_API_AUTH)
+        disable_auth = auth_setting.value.lower() == "true"
+    except HTTPException:
+        # 如果设置不存在，使用默认值（需要鉴权）
+        disable_auth = False
 
-    await session.refresh(api_key)
-    await session.refresh(user)
-    await session.refresh(plan)
+    # Get and validate API key（如果未禁用鉴权）
+    if disable_auth:
+        # 创建一个虚拟的 API key、user 和 plan 对象
+        # 使用一个默认的管理员用户和计划
+        from src.plan.service import get_user_plan
+        
+        # 尝试获取第一个管理员用户
+        admin_user_query = select(UserDB).where(UserDB.is_admin == True).limit(1)
+        admin_user_result = await session.execute(admin_user_query)
+        admin_user = admin_user_result.scalar_one_or_none()
+        
+        if not admin_user:
+            raise HTTPException(status_code=500, detail="No admin user found for disabled auth mode")
+        
+        # 获取该用户的计划
+        plan = await get_user_plan(session, admin_user)
+        
+        # 创建一个虚拟的 API key 对象（不保存到数据库）
+        api_key = ApiKeyDB(
+            id=None,  # 虚拟 ID，设为 None 以避免数据库操作
+            key="disabled_auth",
+            user_id=admin_user.id,
+            revoked=False,
+        )
+        user = admin_user
+    else:
+        # 正常鉴权流程
+        api_key, user, plan = await get_api_key_from_request(request_raw, session)
 
-    if api_key.id is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        await session.refresh(api_key)
+        await session.refresh(user)
+        await session.refresh(plan)
 
-    if not user.is_admin:
-        # Check rate limits
-        await check_rate_limits(session, api_key, plan)
+        if api_key.id is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        if not user.is_admin:
+            # Check rate limits
+            await check_rate_limits(session, api_key, plan)
 
     # Get request data
     logger.info(f"Received request for path: {full_path}")
@@ -258,24 +299,28 @@ async def request_forwarding(
             logger.error(f"Error: {e}")
             raise e
     except HTTPException as e:
-        await log_api_key_usage(
-            session,
-            api_key.id,
-            full_path,
-            request_raw.method,
-            request_info.model_name,
-            e.status_code,
-        )
+        # 只有在启用鉴权时才记录 API key 使用情况
+        if api_key.id is not None:
+            await log_api_key_usage(
+                session,
+                api_key.id,
+                full_path,
+                request_raw.method,
+                request_info.model_name if 'request_info' in locals() else None,
+                e.status_code,
+            )
         raise e
     except Exception as e:
-        await log_api_key_usage(
-            session,
-            api_key.id,
-            full_path,
-            request_raw.method,
-            request_info.model_name,
-            500,
-        )
+        # 只有在启用鉴权时才记录 API key 使用情况
+        if api_key.id is not None:
+            await log_api_key_usage(
+                session,
+                api_key.id,
+                full_path,
+                request_raw.method,
+                request_info.model_name if 'request_info' in locals() else None,
+                500,
+            )
         raise HTTPException(
             status_code=500, detail="Error: Failed to connect to the endpoint"
         ) from e

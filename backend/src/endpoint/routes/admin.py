@@ -17,6 +17,7 @@ from src.endpoint.service import (
     get_latest_task_for_endpoint,
     get_task_by_id,
     manual_trigger_endpoint_test,
+    test_all_endpoints,
     update_endpoint,
 )
 from src.user.service import get_current_admin_user
@@ -140,6 +141,20 @@ async def _get_task_by_id(
 )
 async def _batch_test_endpoints(
     batch_operation_result: BatchOperationResult = Depends(batch_test_endpoints),
+) -> BatchOperationResult:
+    return batch_operation_result
+
+
+@endpoint_admin_router.post(
+    "/batch-test/all",
+    response_model=BatchOperationResult,
+    status_code=status.HTTP_202_ACCEPTED,
+    description="Test all endpoints",
+    response_description="Result of testing all endpoints",
+    dependencies=[Depends(get_current_admin_user)],
+)
+async def _test_all_endpoints(
+    batch_operation_result: BatchOperationResult = Depends(test_all_endpoints),
 ) -> BatchOperationResult:
     return batch_operation_result
 
